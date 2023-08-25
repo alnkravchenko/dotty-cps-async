@@ -53,6 +53,8 @@ trait CpsTryMonadContext[F[_]] extends CpsThrowMonadContext[F] {
 
 }
 
+
+
 trait CpsConcurrentMonadContext[F[_]] extends CpsTryMonadContext[F] {
 
   /**
@@ -64,9 +66,12 @@ trait CpsConcurrentMonadContext[F[_]] extends CpsTryMonadContext[F] {
 
 object CpsMonadContext {
 
+  import cps.plugin.scaffolding.requiringCpsCompilerPlugin
+
   @experimental
-  given monadContext[F[_]](using direct:CpsDirect[F]): CpsTryMonadContext[F] =
-     direct.context
+  inline given monadContext[F[_]](using direct:CpsDirect[F]): CpsTryMonadContext[F] =
+    direct.context
+    //TODO:requiringCpsCompilerPlugin(direct.context)
 
 }
 
@@ -148,7 +153,7 @@ trait CpsTryMonadInstanceContext[F[_]] extends CpsTryMonad[F] {
     override type Context = CpsTryMonadInstanceContextBody[F]
 
     override def apply[T](op: Context => F[T]): F[T] =
-      op(CpsTryMonadInstanceContextBody(this))
+        op(CpsTryMonadInstanceContextBody(this))
 
 }
 

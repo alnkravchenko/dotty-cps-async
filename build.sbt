@@ -1,8 +1,10 @@
+//val dottyVersion = "3.4.0-RC1-bin-SNAPSHOT"
 //val dottyVersion = "3.3.2-RC1-bin-SNAPSHOT"
+//val dottyVersion = "3.3.1-RC4"
 val dottyVersion = "3.3.0"
 
 
-ThisBuild/version := "0.9.18-SNAPSHOT"
+ThisBuild/version := "0.9.19-SNAPSHOT"
 ThisBuild/versionScheme := Some("semver-spec")
 ThisBuild/resolvers ++= Opts.resolver.sonatypeOssSnapshots
 
@@ -17,7 +19,7 @@ val sharedSettings = Seq(
 
 lazy val root = project
   .in(file("."))
-  .aggregate(cps.js, cps.jvm, cps.native)
+  .aggregate(cps.js, cps.jvm, cps.native, compilerPlugin)
   .settings(
     Sphinx / sourceDirectory := baseDirectory.value / "docs",
     SiteScaladocPlugin.scaladocSettings(CpsJVM, cps.jvm / Compile / packageDoc / mappings, "api/jvm"),
@@ -73,6 +75,7 @@ lazy val Root = config("root")
 
 lazy val cpsLoomJVM = project.in(file("jvm-loom"))
                       .dependsOn(cps.jvm)
+                      .disablePlugins(SitePreviewPlugin)
                       .settings(sharedSettings)
                       .settings(name := "dotty-cps-async-loom-test")
                       .settings(
@@ -86,7 +89,7 @@ lazy val cpsLoomJVM = project.in(file("jvm-loom"))
                              baseDirectory.value / ".." / "jvm" / "src" / "test" / "scala",
                              baseDirectory.value / ".." / "shared" / "src" / "test" / "scala",
                         ),
-                        libraryDependencies += "com.novocode" % "junit-interface" % "0.11" % "test",
+                        libraryDependencies += "com.github.sbt" % "junit-interface" % "0.13.3" % "test",
                         Test/fork := true,
                         //for macos
                         Test/javaHome := Some(file("/Library/Java/JavaVirtualMachines/jdk-19.jdk/Contents/Home/")),
@@ -103,11 +106,12 @@ lazy val cpsLoomJVM = project.in(file("jvm-loom"))
 lazy val compilerPlugin = project.in(file("compiler-plugin"))
                            .dependsOn(cps.jvm)
                            .settings(sharedSettings)
+                           .disablePlugins(SitePreviewPlugin)
                            .settings(
-                              name := "dotty-cps-compiler-plugin",
+                              name := "dotty-cps-async-compiler-plugin",
                               libraryDependencies ++= Seq(
                                   "org.scala-lang" %% "scala3-compiler" % scalaVersion.value % "provided",
-                                  "com.novocode" % "junit-interface" % "0.11" % Test,
+                                  "com.github.sbt" % "junit-interface" % "0.13.3" % "test",
                               ),
                               // TODO: split test into subdirectories.
                               //Test/scalacOptions ++= {
@@ -126,12 +130,13 @@ lazy val compilerPluginTests = crossProject(JSPlatform, JVMPlatform, NativePlatf
                            .jvmConfigure(_.dependsOn(compilerPlugin))
                            .jsConfigure(_.dependsOn(compilerPlugin))
                            .nativeConfigure(_.dependsOn(compilerPlugin))
+                           .disablePlugins(SitePreviewPlugin)
                            .settings(sharedSettings)
                            .settings(
                               name := "dotty-cps-compiler-plugin-tests",
                               libraryDependencies ++= Seq(
                                   "org.scala-lang" %% "scala3-compiler" % scalaVersion.value % "provided",
-                                  "com.novocode" % "junit-interface" % "0.11" % Test,
+                                  "com.github.sbt" % "junit-interface" % "0.13.3" % "test",
                               ),
                               Compile / unmanagedSourceDirectories := Seq(),
                               Test / unmanagedSourceDirectories ++= Seq(
@@ -141,28 +146,31 @@ lazy val compilerPluginTests = crossProject(JSPlatform, JVMPlatform, NativePlatf
                                   val jar = (compilerPlugin / Compile / packageBin).value
                                   Seq(s"-Xplugin:${jar.getAbsolutePath}", s"-Jdummy=${jar.lastModified}",
                                        "-color:never",
-                                       "-explain"
+                                       "-explain",
                                      )
                               }
                            ).jvmSettings(
                               libraryDependencies += "com.github.sbt" % "junit-interface" % "0.13.3" % "test",
                               Test / unmanagedSourceDirectories ++= Seq(
                                 baseDirectory.value / ".." / ".." / "jvm" / "src" / "test" / "scala",
-                              )
+                              ),
+                              Test / unmanagedSources / excludeFilter := "TestSF1W1.scala" || "TestSL3.scala"
                            ).jsSettings(
                               scalaJSUseMainModuleInitializer := true,
                               libraryDependencies += ("org.scala-js" %% "scalajs-junit-test-runtime" % "1.8.0" % Test).cross(CrossVersion.for3Use2_13),
                               mimaFailOnNoPrevious := false,
                               Test / unmanagedSourceDirectories ++= Seq(
-                                  baseDirectory.value / ".." / "jvm" / "src" / "test" / "scala",
-                              )
+                                  baseDirectory.value / ".." / ".." / "js" / "src" / "test" / "scala",
+                              ),
+                              Test / unmanagedSources / excludeFilter := "TestSF1W1.scala" || "TestSL3.scala" || "TestSF4.scala"
                            ).nativeSettings(
                               libraryDependencies += "org.scala-native" %%% "junit-runtime" % nativeVersion % Test,
                               libraryDependencies += "com.github.lolgab" %%% "native-loop-core" % "0.2.1" % Test,
                               addCompilerPlugin("org.scala-native" % "junit-plugin" % nativeVersion cross CrossVersion.full),
                               Test / unmanagedSourceDirectories ++= Seq(
-                                  baseDirectory.value / ".." / "native" / "src" / "test" / "scala"
-                              )
+                                  baseDirectory.value / ".." / ".." / "native" / "src" / "test" / "scala"
+                              ),
+                              Test / unmanagedSources / excludeFilter := "TestSF1W1.scala" || "TestSL3.scala"
                            )
 
 

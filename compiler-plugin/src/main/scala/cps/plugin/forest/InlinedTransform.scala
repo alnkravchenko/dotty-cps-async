@@ -22,7 +22,7 @@ object InlinedTransform {
 
     def newBinding: Option[MemberDef]
 
-    def generateFlatMap(tail: CpsTree)(using Context): Option[CpsTree]
+    def generateFlatMap(tail: CpsTree)(using Context, CpsTopLevelContext): Option[CpsTree]
 
     def substitute(tree: Tree, treeMap: BinginsTreeMap, ctx:Context)(using CpsTopLevelContext): Option[Tree]
 
@@ -34,7 +34,7 @@ object InlinedTransform {
     def newBinding: Option[MemberDef] = {
       Some(origin)
     }
-    def generateFlatMap(tail: CpsTree)(using Context): Option[CpsTree] = None
+    def generateFlatMap(tail: CpsTree)(using Context, CpsTopLevelContext): Option[CpsTree] = None
     def substitute(tree: Tree,  treeMap: BinginsTreeMap, ctx: Context)(using CpsTopLevelContext): Option[Tree] = None
   }
 
@@ -42,7 +42,7 @@ object InlinedTransform {
     def newBinding: Option[MemberDef] = {
       Some(newValDef)
     }
-    def generateFlatMap(tail:CpsTree)(using Context): Option[CpsTree] = None
+    def generateFlatMap(tail:CpsTree)(using Context, CpsTopLevelContext): Option[CpsTree] = None
     override def substitute(tree: Tree, treeMap: BinginsTreeMap, ctx: Context)(using CpsTopLevelContext): Option[Tree] = {
       given Context = ctx
       if (origin.symbol == newValDef.symbol)
@@ -89,7 +89,7 @@ object InlinedTransform {
         asyncLambdaValDef
     }
 
-    def generateFlatMap(tail: CpsTree)(using Context): Option[CpsTree] = {
+    override def generateFlatMap(tail: CpsTree)(using Context, CpsTopLevelContext): Option[CpsTree] = {
         val retval = tail.asyncKind match
           case AsyncKind.Sync =>
             MapCpsTree(origin.rhs, adoptedRhs.owner, adoptedRhs,
@@ -163,8 +163,6 @@ object InlinedTransform {
     def unapply(tree:Inlined)(using Context, CpsTopLevelContext): Option[Tree] = {
       // This can depends from the compiler implementation.
       //  Note, that expected naive Inlined(Apply(TypeApply("async"),...) is not here.
-      println(s"InlinedTransform: checkInline, tree.call.symbol.id=${tree.call.symbol.id}, asynsSymbol.id=${Symbols.requiredClass("cps.macros.Async$").id}")
-      println(s"InlinedTransform: checkInline, tree.call.symbol == asyncSymbol = ${tree.call.symbol == Symbols.requiredClass("cps.macros.Async$")}")
       tree.call match
         case id if (id.symbol == Symbols.requiredClass("cps.macros.Async$")) =>
              tree.expansion match

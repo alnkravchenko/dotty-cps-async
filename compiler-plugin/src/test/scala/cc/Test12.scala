@@ -1,0 +1,58 @@
+package cc
+
+import cps.plugin.*
+import org.junit.{Ignore, Test}
+
+
+class Test12 {
+
+
+  @Test
+  @Ignore
+  def testCompileAndRunM1(): Unit =
+    val dotcInvocations = new DotcInvocations()
+    try {
+      val (code, output) =
+        dotcInvocations.compileAndRunFilesInDir("testdata/set12/m1", "cpstest.Test12m1")
+      val reporter       = dotcInvocations.reporter
+      println("summary: " + reporter.summary)
+      println(s"output=${output}")
+      //TODO: check message
+      assert(false , "Expected erros was not reported")
+    } catch {
+      case ex: CpsTransformException =>
+        assert(
+          ex.getMessage == "Object has to be a high-order function",
+          "There should be a CpsTransformException about high-order check"
+        )
+    }
+
+  @Test
+  def testCompileAndRunM2(): Unit =
+    val dotcArgs = DotcInvocations.InvocationArgs(extraDotcArgs = List("-P:rssh.cps:withShiftReplace"))
+    DotcInvocations.checkRuns(selection = (".*".r),dotcArgs = dotcArgs)(
+      TestRun("testdata/set12/m2", "cpstest.Test12m2", "prefixmyurltransformed\n")
+    )
+
+  @Test
+  @Ignore
+  def testCompileAndRunM3(): Unit =
+    val dotcInvocations = new DotcInvocations()
+    try {
+      val (code, output) =
+        dotcInvocations.compileAndRunFilesInDir("testdata/set12/m3", "cpstest.Test12m3")
+      val reporter       = dotcInvocations.reporter
+      println("summary: " + reporter.summary)
+      println(s"output=${output}")
+      //TODO: check message
+      assert(false, "Expected errors was not reported")
+    } catch {
+      case ex: CpsTransformException =>
+        ex.printStackTrace()
+        assert(
+          ex.getMessage == "Unsupported type of function. The return type must not be a function",
+          "There should be a CpsTransformException about unsupported type"
+        )
+    }
+
+}

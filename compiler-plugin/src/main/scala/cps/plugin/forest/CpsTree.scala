@@ -10,7 +10,8 @@ import core.Symbols.*
 import core.Names.*
 import ast.tpd.*
 import cps.plugin.*
-import dotty.tools.dotc.ast.tpd
+import dotty.tools.dotc.ast.{tpd, untpd}
+import dotty.tools.dotc.ast.untpd.TypedSplice
 
 /**
  * CpsTree -- transfomed element
@@ -29,7 +30,9 @@ import dotty.tools.dotc.ast.tpd
  *    |- SeqCpsTree
  *    |- BlockBoundsCpsTree
  *    |- SelectTypeApplyTypedCpsTree
- *    |- InlinedCpsTree
+ *    |- InlinedCpsTree(can-be-deleted)
+ *    |- MemberDefCpsTree
+ *    |- CallChainSubstCpsTree
  *
  **/
 sealed trait CpsTree {
@@ -57,8 +60,9 @@ sealed trait CpsTree {
   def transformedType(using Context, CpsTopLevelContext): Type =
     CpsTransformHelper.cpsTransformedType(originType, tctx.monadType)
   
-  def asyncKind: AsyncKind
+  def asyncKind(using Context, CpsTopLevelContext): AsyncKind
 
+  def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree
 
   def isOriginEqSync(using Context, CpsTopLevelContext): Boolean =
     unpure match
@@ -113,7 +117,6 @@ sealed trait CpsTree {
   def applyRuntimeAwait(runtimeAwait: Tree)(using Context, CpsTopLevelContext): CpsTree
 
   def select(origin: Select)(using Context, CpsTopLevelContext): CpsTree =
-    println(s"CpsTree.select,  origin.type=${origin.tpe.widen.show}")
     SelectTypeApplyTypedCpsTree(
       List(SelectTypeApplyTypedCpsTree.OpSelect(origin)),
       this,
@@ -166,9 +169,10 @@ object CpsTree {
   def unit(owner: Symbol)(using Context): SyncCpsTree =
      UnitCpsTree(Literal(Constant(())), owner)
 
-  def lambda(origin:Tree, owner: Symbol, ddef: DefDef, transformedBody: CpsTree): CpsTree =
-     LambdaCpsTree(origin, owner, ddef, transformedBody)
+  def lambda(origin:Tree, owner: Symbol, ddef: DefDef, closure: Closure, transformedBody: CpsTree): CpsTree =
+     LambdaCpsTree(origin, owner, ddef, closure.tpt.tpe, transformedBody)
 
+  // TODO: add optional inpure
   def opaqueAsyncLambda(origin: Tree, owner: Symbol, changed: Tree, bodyKind: AsyncKind): OpaqueAsyncLambdaTermCpsTree =
       OpaqueAsyncLambdaTermCpsTree(origin, owner, changed, bodyKind)
 
@@ -177,11 +181,13 @@ object CpsTree {
 
 sealed trait SyncCpsTree extends CpsTree  {
 
-  def asyncKind: AsyncKind = AsyncKind.Sync
+  override def asyncKind(using Context, CpsTopLevelContext): AsyncKind = AsyncKind.Sync
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = this
 
   def getUnpure(using Context, CpsTopLevelContext): Tree
 
-  def unpure(using Context, CpsTopLevelContext): Option[Tree] = Some(getUnpure)
+  override def unpure(using Context, CpsTopLevelContext): Option[Tree] = Some(getUnpure)
 
   override def transformed(using Context, CpsTopLevelContext): Tree = {
     val pureName = "pure".toTermName
@@ -248,6 +254,8 @@ case class PureCpsTree(
     }
   }
 
+
+
   override def typed(originTyped: Typed)(using Context, CpsTopLevelContext): CpsTree = {
     if (isOriginEqSync && (originTyped.expr eq this.origin))
       val r = CpsTree.unchangedPure(originTyped, owner)
@@ -258,6 +266,8 @@ case class PureCpsTree(
     else
       super.typed(originTyped)
   }
+
+
 
   override def typeApply(origin: TypeApply)(using Context, CpsTopLevelContext): CpsTree =
     if (isOriginEqSync && origin.fun.eq(this.origin))
@@ -289,32 +299,69 @@ case class SeqCpsTree(
                        last: CpsTree
 ) extends CpsTree {
 
-  override def asyncKind = last.asyncKind
+  override def asyncKind(using Context, CpsTopLevelContext) = last.asyncKind
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = {
+    val normalizedLast = last.normalizeAsyncKind
+    if (normalizedLast eq last) then
+      this
+    else
+      SeqCpsTree(origin, owner, prevs, normalizedLast)
+  }
 
   override def originType(using Context): Type =
     last.originType
 
   override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext): CpsTree =
-    last.castOriginType(ntpe)
+    SeqCpsTree(origin, owner, prevs, last.castOriginType(ntpe))
 
   override def unpure(using Context, CpsTopLevelContext) = {
-    last.asyncKind match
-      case AsyncKind.Sync =>
-        val stats = prevs.map{ t =>
-           t.unpure.get.changeOwner(t.owner,owner)
-        }.toList
-        Some(Block( stats, last.unpure.get.changeOwner(last.owner,owner) ))
-      case _ =>
-        None
+    if (prevs.isEmpty) then
+      last.unpure
+    else
+      last.asyncKind match
+        case AsyncKind.Sync =>
+          val stats = prevs.map{ t =>
+             t.unpure.get.changeOwner(t.owner,owner)
+          }.toList
+          Some(Block( stats, last.unpure.get.changeOwner(last.owner,owner) ).withSpan(origin.span))
+        case AsyncKind.AsyncLambda(_) =>
+          last.unpure.map(etaExpand).map(_.withSpan(origin.span))
+        case _ =>
+          None
   }
 
+
+
   override def transformed(using Context, CpsTopLevelContext): Tree = {
-    if (prevs.length == 0) then
+    if (prevs.isEmpty) then
       last.transformed
     else
-      val tstats = prevs.map(t => t.unpure.get.changeOwner(t.owner,owner))
-      val tlast = last.transformed.changeOwner(last.owner,owner)
-      Block(tstats.toList,tlast)
+      asyncKind match
+        case AsyncKind.AsyncLambda(_) =>
+          etaExpand(last.transformed).withSpan(origin.span)
+        case _ =>
+          val tstats = prevs.map(t => t.unpure.get.changeOwner(t.owner,owner))
+          val tlast = last.transformed.changeOwner(last.owner,owner)
+          Block(tstats.toList,tlast).withSpan(origin.span)
+  }
+
+  private def etaExpand(tLast: Tree)(using Context, CpsTopLevelContext): Tree = {
+    TransformUtil.methodTypeFromFunctionType(tLast.tpe.widen, last.origin.srcPos) match
+      case Some(mt) =>
+        val meth = Symbols.newAnonFun(owner, mt)
+        val closure = Closure(meth, tss => {
+           val stats = prevs.map(_.unpure.get).toList
+           val lastTransformed = tLast match
+             case Block(List(ddef),closure) =>
+               Apply(Select(tLast, "apply".toTermName), tss.head)
+             case _ =>
+               Apply(tLast, tss.head)
+           Block(stats, lastTransformed).changeOwner(owner,meth)
+        })
+        closure
+      case None =>
+        throw CpsTransformException(s"Can't convert ${tLast.tpe} to method type", last.origin.srcPos)
   }
   
   // TODO: add span for error reporing
@@ -367,13 +414,11 @@ object SeqCpsTree {
 
 sealed trait AsyncCpsTree extends CpsTree {
 
-  def internalAsyncKind: AsyncKind
+  def internalAsyncKind(using Context, CpsTopLevelContext): AsyncKind
 
-  override def asyncKind = AsyncKind.Async(internalAsyncKind)
+  override def asyncKind(using Context, CpsTopLevelContext) = AsyncKind.Async(internalAsyncKind)
 
   override def unpure(using Context, CpsTopLevelContext) = None
-
-
 
   override def applyRuntimeAwait(runtimeAwait: Tree)(using Context, CpsTopLevelContext): CpsTree =
     val tctx = summon[CpsTopLevelContext]
@@ -387,7 +432,7 @@ sealed trait AsyncCpsTree extends CpsTree {
         tctx.cpsMonadRef,
         tctx.cpsMonadContextRef
       )
-    )
+    ).withSpan(origin.span)
     CpsTree.pure(origin,owner,tree)
 
 
@@ -398,18 +443,40 @@ case class AsyncTermCpsTree(
                              override val origin: Tree,
                              override val owner: Symbol,
                              val transformedTree: Tree,
-                             override val internalAsyncKind: AsyncKind
+                             val vInternalAsyncKind: AsyncKind
 ) extends AsyncCpsTree {
 
+  override def internalAsyncKind(using Context, CpsTopLevelContext): AsyncKind =
+    vInternalAsyncKind
+
   override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext): CpsTree = {
-    if (ntpe =:= origin.tpe) then
+    if (origin.tpe =:= ntpe) then
       this
     else  
-      typed(Typed(origin,TypeTree(ntpe)))
+      typed(Typed(origin,TypeTree(ntpe)).withSpan(origin.span))
   }
 
-  override def asyncKind: AsyncKind =
-    AsyncKind.Async(internalAsyncKind) 
+  override def asyncKind(using Context, CpsTopLevelContext): AsyncKind =
+    AsyncKind.Async(internalAsyncKind)
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree  =
+    internalAsyncKind match
+      case AsyncKind.Sync => this
+      case AsyncKind.Async(internalKind2) =>
+        val valueToFlat = TypedSplice(transformedTree)
+        val flatten = ctx.typer.typed(
+            untpd.Apply(
+                untpd.Select(
+                  untpd.TypedSplice(summon[CpsTopLevelContext].cpsMonadRef),
+                  "flatten".toTermName
+                ),
+              List(valueToFlat)
+            ).withSpan(origin.span)
+          )
+        AsyncTermCpsTree(origin,owner,flatten,internalKind2).normalizeAsyncKind
+      case AsyncKind.AsyncLambda(_) =>
+        throw CpsTransformException("Unexpected lambda expression in async term ",origin.srcPos)
+
 
   override def transformed(using Context, CpsTopLevelContext): Tree =
     transformedTree
@@ -430,7 +497,7 @@ case class AsyncTermCpsTree(
   }  
 
   override def show(using Context): String = {
-    s"AsyncTermCpsTree(t=${transformedTree.show})"
+    s"AsyncTermCpsTree(t=${transformedTree.show}, k=Async(${vInternalAsyncKind}))"
   }
 
 }
@@ -450,8 +517,20 @@ case class MapCpsTree(
     copy(mapFun = mapFun.copy(body = mapFun.body.castOriginType(ntpe)))
   }
 
-  override def internalAsyncKind = 
-    mapFun.body.asyncKind
+  override def internalAsyncKind(using Context, CpsTopLevelContext) =
+    mapSource.asyncKind match
+      case AsyncKind.Sync => AsyncKind.Sync
+      case AsyncKind.Async(internalKind) => internalKind
+      case AsyncKind.AsyncLambda(bodyKind) =>
+        throw CpsTransformException("Lambda can't be mapSource", origin.srcPos)
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = {
+    val normalizedSource = mapSource.normalizeAsyncKind
+    if (normalizedSource eq mapSource) then
+      this
+    else
+      MapCpsTree(origin, owner, normalizedSource, mapFun)
+  }
 
   override def transformed(using Context, CpsTopLevelContext): Tree = {
     val tctx = summon[CpsTopLevelContext]
@@ -531,7 +610,7 @@ case class MapCpsTreeArgument(
             val sym = newSymbol(owner, "_unused".toTermName, Flags.EmptyFlags, 
                               mapCpsTree.mapSource.originType.widen, Symbols.NoSymbol)
             ValDef(sym,EmptyTree)
-        TransformUtil.makeLambda(List(param), body.originType.widen, owner, syncBody, body.owner)
+        TransformUtil.makeLambda(List(param), body.originType.widen, owner, syncBody, body.owner).withSpan(body.origin.span)
   }  
   
   def show(using Context): String = {
@@ -553,12 +632,22 @@ case class FlatMapCpsTree(
   override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext): CpsTree =
     copy(flatMapFun = flatMapFun.copy(body = flatMapFun.body.castOriginType(ntpe)))
 
-  override def internalAsyncKind: AsyncKind =
+  override def internalAsyncKind(using Context, CpsTopLevelContext): AsyncKind =
     flatMapFun.body.asyncKind match
       case AsyncKind.Sync => AsyncKind.Sync
       case AsyncKind.Async(ak) => ak
       case AsyncKind.AsyncLambda(x) =>
         throw CpsTransformException("Invalid flatMap - result of function body should not be lambda",origin.srcPos)
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = {
+    val normalizedSource = flatMapSource.normalizeAsyncKind
+    val normalizedBody = flatMapFun.body.normalizeAsyncKind
+    if ((normalizedSource eq flatMapSource) && (normalizedBody eq flatMapFun.body)) then
+      this
+    else
+      FlatMapCpsTree(origin, owner, normalizedSource,
+            FlatMapCpsTreeArgument(flatMapFun.optParam, normalizedBody))
+  }
 
   override def transformed(using Context, CpsTopLevelContext): Tree = {
     val tctx = summon[CpsTopLevelContext]
@@ -590,11 +679,7 @@ case class FlatMapCpsTree(
 
   override def select(origin: Select)(using Context, CpsTopLevelContext): CpsTree = {
     // TODO:  check about asyncLambda in body
-    println(s"FlatMap.select: origin.type.widen=${origin.tpe.widen.show}")
-    println(s"FlatMap.select: origin.type=${origin.tpe.show}")
     val retval = copy(flatMapFun = flatMapFun.copy(body = flatMapFun.body.select(origin)))
-    println(s"FlatMap.select: origin.type=${origin.tpe.show}")
-    println(s"FlatMap.select: retval=${retval.show} ")
     retval
   }
 
@@ -626,7 +711,7 @@ case class FlatMapCpsTreeArgument(
       ValDef(sym,EmptyTree)
     }
     val transformedBody = body.transformed(using summon[Context].withOwner(body.owner), summon[CpsTopLevelContext])
-    TransformUtil.makeLambda(List(param),body.transformedType,owner,transformedBody, body.owner)
+    TransformUtil.makeLambda(List(param),body.transformedType,owner,transformedBody, body.owner).withSpan(body.origin.span)
   }
 
   def show(using Context):String =
@@ -642,6 +727,7 @@ case class LambdaCpsTree(
                           override val origin: Tree,
                           override val owner: Symbol,
                           val originDefDef: DefDef,
+                          val originClosureType: Type, // closure type,  can be partial function or SAM type
                           val cpsBody: CpsTree
 )  extends CpsTree {
 
@@ -655,13 +741,24 @@ case class LambdaCpsTree(
         case AppliedType(ntpfun, ntpargs) =>
           // TODO: check that params are the same.
           val nResType = ntpargs.last
-          copy(cpsBody = cpsBody.castOriginType(nResType))
+          copy(cpsBody = cpsBody.castOriginType(nResType), originClosureType = NoType)
         case _ =>
           throw CpsTransformException(s"Can't cast lambda to type ${ntpe.show}: expected AppliedType but have ${ntpe}",origin.srcPos)
+    else if (ntpe <:< defn.PartialFunctionOf(WildcardType,WildcardType)) then
+      // TODO: make this forany SAM type
+      LambdaCpsTree(origin, owner, originDefDef, ntpe, cpsBody)
     else
       throw CpsTransformException(s"Can't cast lambda to type ${ntpe.show}: expected function type",origin.srcPos)
 
-  override def asyncKind = AsyncKind.AsyncLambda(cpsBody.asyncKind)
+  override def asyncKind(using Context, CpsTopLevelContext) = AsyncKind.AsyncLambda(cpsBody.asyncKind)
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = {
+    val normalizedBody = cpsBody.normalizeAsyncKind
+    if (normalizedBody eq cpsBody) then
+      this
+    else
+      LambdaCpsTree(origin, owner, originDefDef, originClosureType, normalizedBody)
+  }
 
   override def unpure(using Context, CpsTopLevelContext): Option[Tree] = {
     cpsBody.unpure match
@@ -672,13 +769,20 @@ case class LambdaCpsTree(
             Some(origin)
           case _ =>
             val tpe =  createUnshiftedType()
-            println(s"LambdaCpsTree.unpure:  tpe=${tpe.show}  origin.tpe.widen=${origin.tpe.widen.show}")
-
             val meth = Symbols.newAnonFun(owner,tpe)
-            val closure = Closure(meth, tss => TransformUtil.substParams(unpureBody, originParams, tss.head)
-                                                            .changeOwner(cpsBody.owner, meth)
-                          )
-            val typedClosure = if (tpe =:= origin.tpe.widen) then closure else Typed(closure, TypeTree(origin.tpe.widen))
+            val closure = Closure(meth,
+              { tss =>
+                TransformUtil.substParams(unpureBody, originParams, tss.head)
+                  .changeOwner(cpsBody.owner, meth)
+              },
+              Nil,
+              originClosureType
+            )
+            val typedClosure = if (defn.isFunctionType(origin.tpe.widen) || tpe <:< origin.tpe.widen) then {
+              closure
+            } else {
+              Typed(closure, TypeTree(origin.tpe.widen))
+            }
             Some(typedClosure)
   }
     
@@ -688,7 +792,32 @@ case class LambdaCpsTree(
     val meth = Symbols.newAnonFun(owner,tpe)
     // here cpsBody is received in other context
     // .  TODO:  check ownitu in cpsBody.transformed
-    Closure(meth, tss => TransformUtil.substParams(cpsBody.transformed, originParams, tss.head).changeOwner(cpsBody.owner, meth))
+    val newClosureType = if (originClosureType.exists) {
+       if (originClosureType <:< defn.PartialFunctionOf(WildcardType,WildcardType)) {
+         val targs = originClosureType.baseType(defn.PartialFunctionClass) match
+           case AppliedType(_, args) => args
+           case _ => throw CpsTransformException(s"Can't extract type arguments from ${originClosureType.show}", origin.srcPos)
+         defn.PartialFunctionOf(targs.head, cpsBody.transformedType.widen)
+       } else if (defn.isFunctionType(originClosureType)) {
+         // can use NoType [TODO:  try to find example where this is matter and better use transformed function type]
+         NoType
+       } else if (defn.isContextFunctionType(originClosureType)) {
+         // context type mapped to simple function type in transformed version, because of compability with macro variabt
+         // (where is impossible to create context function)
+          NoType
+       } else {
+          //we alse have Conversion, ...
+          NoType
+          //throw CpsTransformException(s"Can't shift SAM type ${originClosureType.show}",origin.srcPos)
+       }
+    } else {
+       NoType
+    }
+    Closure(meth,
+      { tss => TransformUtil.substParams(cpsBody.transformed, originParams, tss.head).changeOwner(cpsBody.owner, meth)},
+      Nil,
+      newClosureType
+    )
   }
 
   override def appendInBlock(next: CpsTree)(using Context, CpsTopLevelContext): CpsTree = {
@@ -718,7 +847,6 @@ case class LambdaCpsTree(
             tctx.cpsMonadContextRef
           )
         )
-        println(s"applyRuntimeAwait:  runtimeAwait=${runtimeAwait.show}, nBody=${nBody.show}")
         val nDefDef =  ???
         val nLambda: Tree = ???
         CpsTree.pure(origin,owner,nLambda)
@@ -741,21 +869,28 @@ case class LambdaCpsTree(
     val params = originDefDef.termParamss.head
     val paramNames = params.map(_.name)
     val paramTypes = params.map(_.tpe.widen)
-    val retval = MethodType(paramNames)(
-      x => paramTypes,
-      x => cpsBody.transformedType.widen,
-    )
+
+    val retval = if (originDefDef.tpe <:< defn.PartialFunctionOf(WildcardType,WildcardType)) {
+                      ???
+                  } else
+                      MethodType(paramNames)(
+                         x => paramTypes,
+                         x => cpsBody.transformedType.widen,
+                      )
     retval
   }
 
   private def createUnshiftedType()(using Context): Type = {
+    originDefDef.tpe.widen
+    /*
     val params = originDefDef.termParamss.head
     val paramNames = params.map(_.name)
     val paramTypes = params.map(_.tpe.widen)
     MethodType(paramNames)(
       x => paramTypes,
       x => cpsBody.originType.widen
-    )    
+    )
+    */
   }
 
 }
@@ -767,7 +902,9 @@ case class OpaqueAsyncLambdaTermCpsTree(
                           val bodyKind: AsyncKind
                                        ) extends CpsTree {
 
-  override def asyncKind = AsyncKind.AsyncLambda(bodyKind)
+  override def asyncKind(using Context, CpsTopLevelContext) = AsyncKind.AsyncLambda(bodyKind)
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext) = this
 
   override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext): CpsTree = {
     typed(Typed(origin,TypeTree(ntpe)))
@@ -777,9 +914,6 @@ case class OpaqueAsyncLambdaTermCpsTree(
 
   override def transformed(using Context, CpsTopLevelContext): Tree = transformedTree
 
-  override def appendInBlock(next: CpsTree)(using Context, CpsTopLevelContext): CpsTree = {
-    SeqCpsTree(EmptyTree,owner,IndexedSeq(this),next.changeOwner(owner))
-  }
 
   override def applyRuntimeAwait(runtimeAwait: tpd.Tree)(using Context, CpsTopLevelContext): CpsTree = {
     val tpe = transformedTree.tpe.widen.dealias
@@ -850,6 +984,34 @@ case class OpaqueAsyncLambdaTermCpsTree(
     s"OpaqueAsyncLambdaTermCpsTree(${transformedTree.show})"
   }
 
+  def toLambdaCpsTree(using Context, CpsTopLevelContext): LambdaCpsTree = {
+    // check trivial casw where transformed tree is lambda itself
+    transformedTree match
+      case lambda@Block(List(ddef: DefDef), closure: Closure) if closure.meth.symbol == ddef.symbol  =>
+        val Kind = CpsTransformHelper.asyncKindFromTransformedType(ddef.rhs.tpe.widen.dealias, summon[CpsTopLevelContext].monadType)
+        LambdaCpsTree(origin, owner, ddef, closure.tpt.tpe, CpsTree.impure(ddef.rhs, ddef.symbol, ddef.rhs, asyncKind))
+      case _ =>
+        TransformUtil.methodTypeFromFunctionType(transformedTree.tpe.widen.dealias, origin.srcPos) match
+          case Some(mt) =>
+            val sym = Symbols.newAnonFun(owner,mt)
+            val lambda = DefDef(sym, tss => {
+              val nBody = Apply(
+                Select(transformedTree,"apply".toTermName),
+                tss.head
+              )
+              nBody
+            })
+            val cpsBody = bodyKind match
+              case AsyncKind.Sync => CpsTree.pure(EmptyTree,owner,lambda.rhs)
+              case AsyncKind.Async(internalKind) => CpsTree.impure(EmptyTree,owner,lambda.rhs,internalKind)
+              case AsyncKind.AsyncLambda(bodyKind) => CpsTree.opaqueAsyncLambda(EmptyTree,owner,lambda.rhs,bodyKind)
+            LambdaCpsTree(origin, owner, lambda, lambda.tpe.widen, cpsBody)
+          case None =>
+            throw CpsTransformException(s"Can't convert ${transformedTree.tpe.show} to method type", origin.srcPos)
+  }
+
+
+
 }
 
 
@@ -907,8 +1069,14 @@ case class BlockBoundsCpsTree(internal:CpsTree) extends CpsTree {
 
     override def transformed(using Context, CpsTopLevelContext) = internal.transformed
 
-    override def asyncKind = internal.asyncKind
+    override def asyncKind(using Context, CpsTopLevelContext) = internal.asyncKind
 
+    override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = {
+      val normalizedInternal = internal.normalizeAsyncKind
+      if (normalizedInternal eq internal) then
+        this
+      else BlockBoundsCpsTree(normalizedInternal)
+    }
 
     override def withOrigin(term:Tree): CpsTree =
       BlockBoundsCpsTree(internal.withOrigin(term))
@@ -918,19 +1086,11 @@ case class BlockBoundsCpsTree(internal:CpsTree) extends CpsTree {
 
     override def changeOwner(newOwner: Symbol)(using Context) =
       BlockBoundsCpsTree(internal.changeOwner(newOwner))
-
-    override def select(origin: Select)(using Context, CpsTopLevelContext): CpsTree = {
-      BlockBoundsCpsTree(internal.select(origin))
-    }
-
-    override def typed(origin: Typed)(using Context, CpsTopLevelContext): CpsTree = {
-      BlockBoundsCpsTree(internal.typed(origin))
-    }
-
-    override def typeApply(origin: TypeApply)(using Context, CpsTopLevelContext): CpsTree = {
-      BlockBoundsCpsTree(internal.typeApply(origin))
-    }
-
+  
+    //
+    // note, that select can't be overrided, because ( Select({ statements,  x }, "&&") will create unexpected 
+    //  not-eta expanded tree.
+  
     override def show(using Context):String = {
       s"BlockBoundsCpsTree(${internal.show})"
     }  
@@ -945,9 +1105,18 @@ case class SelectTypeApplyTypedCpsTree(records: Seq[SelectTypeApplyTypedCpsTree.
 
     override def owner = nested.owner
 
-    override def asyncKind: AsyncKind = nested.asyncKind
+    override def asyncKind(using Context, CpsTopLevelContext): AsyncKind = nested.asyncKind
 
-     override def originType(using Context): Type =
+    override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = {
+      val normalizedNested = nested.normalizeAsyncKind
+      if (normalizedNested eq nested) then
+        this
+      else
+        SelectTypeApplyTypedCpsTree(records, normalizedNested, origin)
+    }
+
+
+    override def originType(using Context): Type =
        if (records.isEmpty) then
           nested.originType
        else
@@ -1117,7 +1286,16 @@ case class InlinedCpsTreeDisabled(override val origin:Inlined,
                           bindings: List[MemberDef],  // transformed bindings.
                           expansion: CpsTree) extends CpsTree {
 
-  override def asyncKind = expansion.asyncKind
+  override def asyncKind(using Context, CpsTopLevelContext) = expansion.asyncKind
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext) = {
+    val nExpansion = expansion.normalizeAsyncKind
+    if (nExpansion eq expansion) {
+      this
+    } else {
+      copy(expansion = nExpansion)
+    }
+  }
 
   override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext) = ???
 
@@ -1191,6 +1369,122 @@ object InlinedCpsTree {
                                       newBindings: List[MemberDef],
                                       substitutions: Map[Symbol,Tree]
                                       )
+
+
+}
+
+
+/**
+ * Definition cps tree,
+ *   Can be only in block and can't be last in block. (TODO: checked by BlockBoundsCpsTree)
+ * @param origin
+ * @param changed
+ */
+case class MemberDefCpsTree(
+                              override val origin: Tree,
+                              override val owner: Symbol,
+                              definition: MemberDef) extends CpsTree {
+
+  override def asyncKind(using Context, CpsTopLevelContext) = AsyncKind.Sync
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = this
+
+  override def withOrigin(term: Tree): CpsTree = copy(origin = term)
+
+
+  override def transformed(using Context, CpsTopLevelContext): Tree = {
+    definition
+  }
+
+  override def unpure(using Context, CpsTopLevelContext) = {
+    Some(definition)
+  }
+
+  override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext): CpsTree = {
+    throw CpsTransformException(s"MemberDefCpsTree  can't be in position which require cast", origin.srcPos)
+  }
+
+  override def applyRuntimeAwait(runtimeAwait: Tree)(using Context, CpsTopLevelContext): CpsTree = this
+
+  override def show(using Context): String = origin.show
+
+  override def changeOwner(newOwner: Symbol)(using Context): CpsTree =
+    copy(owner = newOwner, definition = definition.changeOwner(owner, newOwner))
+
+
+}
+
+case class CallChainSubstCpsTree(override val origin: Tree,
+                                 override val owner: Symbol,
+                                 call: CpsTree) extends CpsTree {
+
+  call match
+    case CallChainSubstCpsTree(_,_,_) =>
+      throw CpsTransformException(s"CallChainSubstCpsTree can't be in position which require CallChainCpsTree", origin.srcPos)
+    case _ =>
+
+  override def asyncKind(using Context, CpsTopLevelContext) = finishChain().asyncKind
+
+  override def normalizeAsyncKind(using Context, CpsTopLevelContext): CpsTree = this
+
+  override def withOrigin(term: Tree): CpsTree = copy(origin = term)
+
+  override def castOriginType(ntpe: Type)(using Context, CpsTopLevelContext) = {
+    finishChain().castOriginType(ntpe)
+  }
+
+  override def transformed(using Context, CpsTopLevelContext): Tree = {
+    finishChain().transformed
+  }
+
+  override def unpure(using Context, CpsTopLevelContext): Option[Tree] = {
+    finishChain().unpure
+  }
+
+  override def applyRuntimeAwait(runtimeAwait: Tree)(using Context, CpsTopLevelContext): CpsTree = this
+
+  override def show(using Context): String = s"CallChainCpsTree(${call.show})"
+
+  override def changeOwner(newOwner: Symbol)(using Context): CpsTree =
+    copy(owner = newOwner, call = call.changeOwner(newOwner))
+
+  override def select(origin: Select)(using Context, CpsTopLevelContext): CpsTree = {
+    CallChainSubstCpsTree(origin,owner, call.select(origin))
+    //PureCpsTree(origin,owner,Select(call,origin.name).withSpan(origin.span))
+    //throw CpsTransformException(s"impossible case: select after CallChainSubstCpsTree", origin.srcPos)
+  }
+
+  override def typed(origin: Typed)(using Context, CpsTopLevelContext): CpsTree = {
+    CallChainSubstCpsTree(origin,owner, call.typed(origin))
+  }
+
+  override def typeApply(origin: TypeApply)(using Context, CpsTopLevelContext): CpsTree = {
+    CallChainSubstCpsTree(origin,owner,call.typeApply(origin))
+    //throw CpsTransformException(s"impossible case: typeApply after CallChainSubstCpsTree", origin.srcPos)
+  }
+
+
+  def finishChain()(using Context, CpsTopLevelContext): CpsTree = {
+     val finishChainSelect = call.select(Select(call.origin,"_finishChain".toTermName))
+     val finishChainType = finishChainSelect.originType.widen
+     if (finishChainType <:< defn.NothingType) then
+        throw CpsTransformException(s"This chain call not support finish", finishChainSelect.origin.srcPos)
+     else if (finishChainType.baseType(summon[CpsTopLevelContext].monadType.typeSymbol) != NoType) then
+        finishChainSelect.asyncKind match
+          case  AsyncKind.Sync =>
+            CpsTree.impure(origin,owner,finishChainSelect.unpure.get,AsyncKind.Sync)
+          case AsyncKind.Async(internalKind) =>
+            val nSymbol = Symbols.newSymbol(owner, "x".toTermName, Flags.EmptyFlags, finishChainType, Symbols.NoSymbol)
+            val nValDef = ValDef(nSymbol, EmptyTree)
+            val nValRef = ref(nValDef.symbol)
+            FlatMapCpsTree(origin,owner,finishChainSelect,FlatMapCpsTreeArgument(Some(nValDef),CpsTree.impure(origin,owner,nValRef,internalKind)))
+          case AsyncKind.AsyncLambda(bodyKind) =>
+            throw CpsTransformException(s"impossible case: finishChainType is Lambda", finishChainSelect.origin.srcPos)
+     else if (finishChainType.baseType(Symbols.requiredClass("cps.runtime.CpsCallChainSubstAsyncShift"))!=NoType) then
+       CallChainSubstCpsTree(origin,owner,finishChainSelect)
+     else
+       finishChainSelect
+  }
 
 
 }

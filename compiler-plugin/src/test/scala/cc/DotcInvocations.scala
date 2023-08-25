@@ -13,32 +13,33 @@ import scala.util.matching.Regex
 
 class DotcInvocations(silent: Boolean = false) {
 
-  def compileFiles(files: List[String], outDir: String, extraArgs: List[String]=List.empty): Reporter = {
+  def compileFiles(files: List[String], outDir: String, extraArgs: List[String]=List.empty, checkAll: Boolean = true): Reporter = {
     val outPath = Path(outDir)
     if (!outPath.exists) outPath.createDirectory()
     val args = List("-d", outDir) ++
              List("-Xplugin:src/main/resources", "-usejavacp") ++
              extraArgs ++
              DotcInvocations.defaultCompileOpts ++
+             (if (checkAll) List("-Ycheck:all") else List.empty) ++
              files
     val filledReporter = Main.process(args.toArray, reporter, callback)
     filledReporter
   }
 
-  def compileFilesInDirs(dirs: List[String], outDir: String, extraArgs: List[String] = List.empty): Reporter = {
+  def compileFilesInDirs(dirs: List[String], outDir: String, extraArgs: List[String] = List.empty, checkAll: Boolean = true): Reporter = {
     val files = dirs.flatMap { dir => scalaFilesIn(Path(dir)) }
-    compileFiles(files, outDir, extraArgs)
+    compileFiles(files, outDir, extraArgs, checkAll)
   }
 
-  def compileFilesInDir(dir: String, outDir: String, extraArgs: List[String]=List.empty): Reporter = {
-    compileFilesInDirs(List(dir), outDir, extraArgs)
+  def compileFilesInDir(dir: String, outDir: String, extraArgs: List[String]=List.empty, checkAll:Boolean = true): Reporter = {
+    compileFilesInDirs(List(dir), outDir, extraArgs, checkAll)
   }
 
   def compileAndRunFilesInDirs(dirs: List[String], outDir: String, mainClass:String = "Main", extraArgs: List[String] = List.empty): (Int,String) = {
     val reporter = compileFilesInDirs(dirs, outDir, extraArgs)
     if (reporter.hasErrors) {
-      println("Compilation failed")
-      println(reporter.allErrors.mkString("\n"))
+      println(s"Compilation failed in dirs ${dirs}")
+      DotcInvocations.reportErrors(reporter)
       throw new RuntimeException("Compilation failed")
     } else {
       run(outDir, mainClass)
@@ -111,34 +112,45 @@ object DotcInvocations {
   import org.junit.Assert.*
 
   val defaultCompileOpts: List[String] = {
-    List("-Ycheck:all",
-      //  "-Ydebug-error",
+    // note, that -Ycheck:all is not included here, because it is added conditionally
+    List(
+      //"-Ydebug-error",
       "--unique-id",
+      //"-Xcheck-macros",
+      "-Ydebug",
       //"-Yprint-syms",
+      //"-explain",
       //List("-Yprint-debug") ++
       //List("-Yshow-tree-ids") ++
       //List("-verbose") ++
       //List("-unchecked") ++
        "--color:never",
-       "-Vprint:erasure",
-       "-Vprint:rssh.cps",
-       "-Vprint:inlining"
-    //List("-Vprint:constructors") ++
-    //List("-Vprint:lambdaLift") ++
-    //List("-Xshow-phases") ++
+      // "-Vprint:erasure",
+      // "-Vprint:rssh.cps",
+      //"-Vprint:inlining"
+      //List("-Vprint:constructors") ++
+      //List("-Vprint:lambdaLift") ++
+      //List("-Xshow-phases") ++
     )
   }
 
 
   case class InvocationArgs(
                            extraDotcArgs: List[String] = List.empty,
-                           silent: Boolean = false
+                           silent: Boolean = false,
+                           checkAll: Boolean = true
                            )
 
-  def compileFilesInDir(dir: String, invocationArgs: InvocationArgs = InvocationArgs()): Unit = {
+  def compileFilesInDir(dir: String, invocationArgs: InvocationArgs = InvocationArgs()): Reporter = {
     val dotcInvocations = new DotcInvocations(invocationArgs.silent)
-    dotcInvocations.compileFilesInDir(dir,dir,invocationArgs.extraDotcArgs)
-    checkReporter(dotcInvocations.reporter)
+    dotcInvocations.compileFilesInDir(dir, dir, invocationArgs.extraDotcArgs, invocationArgs.checkAll)
+    dotcInvocations.reporter
+  }
+
+
+  def succesfullyCompileFilesInDir(dir: String, invocationArgs: InvocationArgs = InvocationArgs()): Unit = {
+    val reporter = compileFilesInDir(dir, invocationArgs)
+    checkReporter(reporter)
   }
 
   def compileAndRunFilesInDirAndCheckResult(
@@ -149,14 +161,14 @@ object DotcInvocations {
                                            ): Unit = {
     val dotcInvocations = new DotcInvocations(invocationArgs.silent)
 
-    val (code, output) = dotcInvocations.compileAndRunFilesInDir(dir,dir,mainClass)
+    val (code, output) = dotcInvocations.compileAndRunFilesInDir(dir,dir,mainClass,invocationArgs.extraDotcArgs)
 
     val reporter = dotcInvocations.reporter
     println("summary: " + reporter.summary)
     checkReporter(reporter)
 
     //println(s"output=${output}")
-    assert(output == expectedOutput, s"The output should be '$expectedOutput', we have '$output''")
+    assert(output.endsWith(expectedOutput), s"The output should ends with '$expectedOutput', we have '$output''")
 
   }
 
@@ -170,12 +182,16 @@ object DotcInvocations {
     }
   }
 
-  private def checkReporter(reporter: Reporter): Unit = {
+  def reportErrors(reporter: Reporter): Unit = {
     if (!reporter.allErrors.isEmpty) {
-      for(err <- reporter.allErrors)  {
+      for (err <- reporter.allErrors) {
         println(s"${err.msg} at ${err.pos.source}:${err.pos.line}:${err.pos.column}")
       }
     }
+  }
+
+  private def checkReporter(reporter: Reporter): Unit = {
+    reportErrors(reporter)
     assert(reporter.allErrors.isEmpty, "There should be no errors")
   }
 

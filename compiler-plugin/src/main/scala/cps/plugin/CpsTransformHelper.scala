@@ -1,13 +1,14 @@
 package cps.plugin
 
 import scala.annotation.tailrec
-
 import dotty.tools.dotc.*
 import ast.tpd.*
 import core.*
 import core.Contexts.*
+import core.Decorators.*
 import core.Symbols.*
 import core.Types.*
+import dotty.tools.dotc.typer.ProtoTypes
 import util.SrcPos
 import util.Spans.Span
 
@@ -24,6 +25,11 @@ object CpsTransformHelper {
     Symbols.requiredClass("cps.CpsDirect")
 
 
+  /**
+   * Check that type is CpsDirect[F].
+   * Note, that this function should be called before erasure.
+   * After erasure the encoding is different
+   */
   def isCpsDirectType(tpe:Type, debug:Boolean=false)(using Context): Boolean = {
      val retval = tpe.dealias match
        case AppliedType(tycon, List(targ)) if (tycon.typeSymbol == cpsDirectClassSymbol) =>
@@ -31,11 +37,13 @@ object CpsTransformHelper {
        case other =>
          other.baseType(cpsDirectClassSymbol) != NoType
      if (debug)
-        println(s"isCpsDirectType(${tpe.show} [tree:${tpe}]) = ${retval}")
+        report.debuglog(s"isCpsDirectType(${tpe.show} [tree:${tpe}]) = ${retval}")
      retval
   }
 
   /**
+   * Extract monad type from context function type.
+   * TODO:  Type-lambda monads case,  now we think that this is F[_].
    *@param contextFunctionArgType is CpsDirect[F] or CpsMonadContext[F]
    *@param wrapperSymbol: naked symbol of wrapper. i.e. requiredClass("cps.CpsDirect") or requiredClass("cps.CpsMonadContext")
    *@return F
@@ -44,6 +52,7 @@ object CpsTransformHelper {
     contextFunctionArgType.dealias match
       case AppliedType(tycon, List(targ)) if (tycon.typeSymbol == wrapperSymbol) =>
              targ
+      // TODO: check type parameter (write test)
       case other =>
              val cntBase = other.baseType(wrapperSymbol)
              if (cntBase != NoType) 
@@ -96,10 +105,6 @@ object CpsTransformHelper {
   def cpsTransformedType(t:Type, fType:Type, debug: Boolean = false)(using Context): Type = {
     val retval = t match
       case AppliedType(funCn,params) =>
-        if (debug) {
-          println(s"cpsTransformedType, funCn = ${funCn.show}, isFunctionType=${defn.isFunctionType(funCn)}, isContextFunctionType=${defn.isContextFunctionType(funCn)}")
-          println(s"cpsTransformedType, isContextFunctionType(t)=${defn.isContextFunctionType(t)}")
-        }
         if (defn.isFunctionType(t) || defn.isContextFunctionType(t)) then
           val nParams = adoptResultTypeParam(params, fType)
           AppliedType(funCn, nParams)
@@ -117,10 +122,6 @@ object CpsTransformHelper {
         PolyType(pt.paramNames)(_ => pt.paramInfos, _ => cpsTransformedType(pt.resType, fType, debug))
       case _  =>
         decorateTypeApplications(fType).appliedTo(t.widen)
-    if (debug) {
-      println(s"cpsTransformedType: in = (${t.show}   [${t}]")
-      println(s"cpsTransformedType: out = ${retval.show}   [${retval}]")
-    }
     retval
   }
 
@@ -140,11 +141,70 @@ object CpsTransformHelper {
           else
             MethodType(mt.paramNames)(_ => mt.paramInfos, _ => cpsTransformedErasedType(mt.resType, fType))
         case _ =>
-            // TODO: optimize
-            val retval = TypeErasure.erasure(decorateTypeApplications(fType).appliedTo(t))
-            println(s"eraded type application: ${retval.show},  is fType == ${retval == fType}, =:+= ${retval =:= fType}")
-            retval
+            fType match
+              case wt:WildcardType =>
+                defn.ObjectType
+              case _ =>
+                // TODO: optimize
+                val retval = TypeErasure.erasure(decorateTypeApplications(fType).appliedTo(t))
+                retval
   }
+
+  def extractReturnType(tpe: Type)(using Context): Type = {
+    tpe match
+      case mpt: MethodOrPoly =>
+        extractReturnType(mpt.resType)
+      case _ =>
+        tpe
+  }
+
+  def asyncKindFromTransformedType(tpe: Type, ft: Type)(using Context): AsyncKind = {
+    tpe match
+      case AppliedType(tycon,args) if tycon =:= ft =>
+        AsyncKind.Async(asyncKindFromTransformedType(args.head,ft))
+      case AppliedType(tycon,args) if (defn.isFunctionSymbol(tycon.typeSymbol) || defn.isContextFunctionClass(tycon.typeSymbol)) =>
+        AsyncKind.AsyncLambda(asyncKindFromTransformedType(args.last,ft))
+      case mt: MethodType =>
+        AsyncKind.AsyncLambda(asyncKindFromTransformedType(mt.resType,ft))
+      case pt: PolyType =>
+        AsyncKind.AsyncLambda(asyncKindFromTransformedType(pt.resType,ft))
+      case other =>
+        // TODO: use inferImplcit
+        //summon[Context].typer.inferImplicit()
+        ft match
+          case HKTypeLambda(List(paramBound), resType) =>
+            val withAny = ft.appliedTo(WildcardType)
+            if (other <:< withAny) then
+              // we can't determinate internal kind without running own type unfication,
+              //  so,  approximate it with Sync
+              AsyncKind.Async(AsyncKind.Sync)
+            else
+              AsyncKind.Sync
+          case _ =>
+             AsyncKind.Sync
+  }
+
+  /*
+  def unwrappTypeFromMonad(ftExpr: Tree, ft: Type,  srcPos: SrcPos)(using Context): Type = {
+    //TIDO: check
+    //val (tl, tv) = ProtoTypes.constrained(ft,t)
+    //tv.head
+    t.widen.dealias match
+      case AppliedType(tycon,args) if tycon =:= ft =>
+        args.head
+      case other =>
+        throw CpsTransformException(s"can't extract type from ${other.show} as monad ${ft.show}", srcPos)
+
+  }*/
+
+  def isDirectContext(tpe:Type)(using Context): Boolean = {
+    if (tpe =:= defn.NothingType || tpe =:= defn.NullType) then
+      false
+    else
+      val directContextType = Symbols.requiredClassRef("cps.CpsDirect").appliedTo(Types.WildcardType)
+      tpe <:< directContextType
+  }
+
 
   def findImplicitInstance(tpe: Type, span: Span)(using ctx:Context): Option[Tree] = {
     val searchResult = ctx.typer.inferImplicitArg(tpe,span)
@@ -152,24 +212,38 @@ object CpsTransformHelper {
       case _ : typer.Implicits.SearchFailureType => None
       case _  => Some(searchResult)
   }
-  
+
+  def findWrapperForMonad(wrapperClassName: String, monadType: Type, span: Span)(using Context): Option[Tree] = {
+    //TODO:  Problem: shows incorrect phase.
+    val cpsMonad = requiredClassRef(wrapperClassName)
+    val tpe = AppliedType(cpsMonad, List(monadType))
+    findImplicitInstance(tpe, span)
+  }
+
+
   def findRuntimeAwait(monadType: Type, span: Span)(using ctx:Context): Option[Tree] = {
-      //TODO:  Problem: shows incorrect phase.
-      val runtimeAwait = requiredClassRef("cps.CpsRuntimeAwait")
-      val tpe = AppliedType(runtimeAwait, List(monadType))
-      findImplicitInstance(tpe, span)
+      findWrapperForMonad("cps.CpsRuntimeAwait", monadType, span)
   }
   
   def findCpsThrowSupport(monadType:Type, span: Span)(using ctx:Context): Option[Tree] = {
-      val cpsThrowSupport = requiredClassRef("cps.CpsThrowSupport")
-      val tpe = AppliedType(cpsThrowSupport, List(monadType))
-      findImplicitInstance(tpe, span)
+      findWrapperForMonad("cps.CpsThrowSupport", monadType, span)
   }
 
   def findCpsTrySupport(monadType: Type, span: Span)(using ctx:Context): Option[Tree] = {
-      val cpsTrySupport = requiredClassRef("cps.CpsTrySupport")
-      val tpe = AppliedType(cpsTrySupport, List(monadType))
-      findImplicitInstance(tpe, span)
+      findWrapperForMonad("cps.CpsTrySupport", monadType, span)
   }
-  
+
+  def findAutomaticColoringTag(monadType: Type, span: Span)(using ctx: Context): Option[Tree] = {
+    findWrapperForMonad("cps.automaticColoring.AutomaticColoringTag", monadType, span)
+  }
+
+  def findCpsMonadMemoization(monadType: Type, span: Span)(using ctx: Context): Option[Tree] = {
+    findWrapperForMonad("cps.CpsMonadMemoization", monadType, span)
+  }
+
+  def findCustomValueDiscardTag(span: Span)(using ctx: Context): Option[Tree] = {
+    findImplicitInstance(Symbols.requiredClassRef("cps.ValueDiscard.CustomTag"), span)
+  }
+
+
 }

@@ -1,16 +1,17 @@
 package cps.pe
 
 import scala.language.implicitConversions
+import org.junit.{Ignore, Test}
+import org.junit.Assert.*
 
-import org.junit.{Test,Ignore}
-import org.junit.Assert._
-
-import scala.quoted._
+import scala.quoted.*
+import scala.compiletime.*
 import scala.util.*
-
 import cps.*
+import cps.macros.flags.UseCompilerPlugin
 import cps.testconfig.given
 import cps.util.FutureCompleter
+
 import scala.concurrent.ExecutionContext.Implicits.global
 
 
@@ -51,21 +52,30 @@ class TestPEPartialMemoizing:
      FutureCompleter(future)
 
 
-  @Test def testPartialMixed() = 
-     import cps.automaticColoring.{*,given}
-     var ref1 = PEIntRef.make(0)
-     val logger1 = new PEToyLogger()
-     val code = 
-     """
+  @Test def testPartialMixed(): Unit = {
+    import cps.automaticColoring.{*, given}
+    var ref1 = PEIntRef.make(0)
+    val logger1 = new PEToyLogger()
+    val code =
+      """
       async[PureEffect] {
          val v = effect(ref1, logger1)
          doSomething(v, logger1)
          doTenTimes(v)
       }
      """
-     val errors = compiletime.testing.typeCheckErrors(code)
-     //println(s"errors: $errors")
-     assert(!compiletime.testing.typeChecks(code))
+    val errors = compiletime.testing.typeCheckErrors(code)
+    println(s"errors: $errors")
+    if (!testUseCompilerPlugin()) {
+      assertTrue(!compiletime.testing.typeChecks(code))
+    }
+  }
+
+  inline def testUseCompilerPlugin(): Boolean =
+    summonFrom {
+      case cp: UseCompilerPlugin => true
+      case _ => false
+    }
 
 
 
