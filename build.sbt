@@ -1,10 +1,10 @@
 //val dottyVersion = "3.4.0-RC1-bin-SNAPSHOT"
 //val dottyVersion = "3.3.2-RC1-bin-SNAPSHOT"
 //val dottyVersion = "3.3.1-RC4"
-val dottyVersion = "3.3.0"
+val dottyVersion = "3.3.1"
 
 
-ThisBuild/version := "0.9.19-SNAPSHOT"
+ThisBuild/version := "0.9.20-SNAPSHOT"
 ThisBuild/versionScheme := Some("semver-spec")
 ThisBuild/resolvers ++= Opts.resolver.sonatypeOssSnapshots
 
@@ -19,7 +19,7 @@ val sharedSettings = Seq(
 
 lazy val root = project
   .in(file("."))
-  .aggregate(cps.js, cps.jvm, cps.native, compilerPlugin)
+  .aggregate(cps.js, cps.jvm, cps.native, compilerPlugin, cpsLoomAddOn)
   .settings(
     Sphinx / sourceDirectory := baseDirectory.value / "docs",
     SiteScaladocPlugin.scaladocSettings(CpsJVM, cps.jvm / Compile / packageDoc / mappings, "api/jvm"),
@@ -43,7 +43,6 @@ lazy val cps = crossProject(JSPlatform, JVMPlatform, NativePlatform)
                             "-unchecked", "-Ydebug-trace", "-Ydebug-names", "-Xprint-types",
                             "-Ydebug", "-uniqid", "-Xcheck-macros", "-Ycheck:macro", "-Yprint-syms",
                             "-Ysafe-init",
-                            "-explain",
                              ),
                              // -explain
                              // -Ydebug-error
@@ -72,9 +71,19 @@ lazy val CpsJS = config("cps.js")
 //lazy val CpsNative = config("cps.native")
 lazy val Root = config("root")
 
+lazy val cpsLoomAddOn = project.in(file("jvm-loom-addon"))
+  .dependsOn(cps.jvm)
+  .disablePlugins(SitePreviewPlugin)
+  .settings(sharedSettings)
+  .settings(
+    name := "dotty-cps-async-loom",
+    scalacOptions ++= Seq("-Xtarget:21",  "-explain" /*, "-color:never"*/ ),
+    libraryDependencies += "com.github.sbt" % "junit-interface" % "0.13.3" % "test",
+  )
 
-lazy val cpsLoomJVM = project.in(file("jvm-loom"))
-                      .dependsOn(cps.jvm)
+
+lazy val cpsLoomTest = project.in(file("jvm-loom-tests"))
+                      .dependsOn(cps.jvm, cpsLoomAddOn)
                       .disablePlugins(SitePreviewPlugin)
                       .settings(sharedSettings)
                       .settings(name := "dotty-cps-async-loom-test")
@@ -92,15 +101,18 @@ lazy val cpsLoomJVM = project.in(file("jvm-loom"))
                         libraryDependencies += "com.github.sbt" % "junit-interface" % "0.13.3" % "test",
                         Test/fork := true,
                         //for macos
-                        Test/javaHome := Some(file("/Library/Java/JavaVirtualMachines/jdk-19.jdk/Contents/Home/")),
+                        //Test/javaHome := Some(file("/Library/Java/JavaVirtualMachines/jdk-19.jdk/Contents/Home/")),
                         //for linux:
                         //Test/javaHome := Some(file("/usr/lib/jvm/jdk-19")),
 
-                        Test/javaOptions ++= Seq(
-                           "--enable-preview", 
-                           "--add-modules", "jdk.incubator.concurrent"
-                        )
+                        //now we have jdk
+                        //Test/javaOptions ++= Seq(
+                        //   "--enable-preview", 
+                        //   "--add-modules", "jdk.incubator.concurrent"
+                        //)
                       )
+
+
 
 
 lazy val compilerPlugin = project.in(file("compiler-plugin"))

@@ -71,7 +71,7 @@ class PhaseSelect(selectedNodes: SelectedNodes) extends PluginPhase {
         tree
       case other =>
         if (!tree.symbol.flags.isOneOf(Flags.InlineOrProxy|Flags.Synthetic) &&
-            CpsTransformHelper.isDirectContext(tree.rhs.tpe)) then
+            CpsTransformHelper.isCpsDirectType(tree.rhs.tpe)) then
               report.error("CpsDirect can't be a value", tree.srcPos)
               tree
         else
@@ -79,7 +79,7 @@ class PhaseSelect(selectedNodes: SelectedNodes) extends PluginPhase {
   }
 
   override def transformAssign(tree: tpd.Assign)(using Context): tpd.Tree = {
-    if (CpsTransformHelper.isDirectContext(tree.tpe)) then
+    if (CpsTransformHelper.isCpsDirectType(tree.tpe)) then
       report.error("CpsDirect can't be a assigned", tree.srcPos)
       tree
     else
