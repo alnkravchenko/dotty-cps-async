@@ -11,7 +11,7 @@ class TestExample1 {
     val reporter = dotcInvocations.compileFilesInDir(
       "testdata/set1/src/cpstest",
       "testdata/set1/target",
-      List("-Vprint:rssh.cps")
+      List.empty  //List("-Vprint:rssh.cps")
     )
 
     println("summary: " + reporter.summary)
@@ -25,7 +25,7 @@ class TestExample1 {
   def testCompileAndRunExample1(): Unit = {
     val dotcInvocations = new DotcInvocations()
 
-    val (code,output0) = dotcInvocations.compileAndRunFilesInDirs(
+    val (code,output0) = dotcInvocations.compileAndRunFilesInDirsJVM(
       List("testdata/set1/src/cpstest"),
       "testdata/set1/target",
       "cpstest.TestExample1"

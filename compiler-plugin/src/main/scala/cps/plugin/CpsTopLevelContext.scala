@@ -6,9 +6,7 @@ import core.Types.*
 import core.Contexts.*
 import core.Decorators.*
 import ast.tpd.*
-import cps.plugin.observatory.*
 
-case class CpsAutomaticColoring(memoization: Tree, analyzer: AutomaticColoringAnalyzer)
 
 case class CpsTopLevelContext(
                                val monadType: Type, // F[_]
@@ -21,9 +19,7 @@ case class CpsTopLevelContext(
                                val optTrySupport: Option[Tree],
                                val debugSettings: DebugSettings,
                                val pluginSettings: CpsPluginSettings,
-                               val isBeforeInliner: Boolean,
-                               val automaticColoring: Option[CpsAutomaticColoring],
-                               val customValueDiscard: Boolean
+                               val isBeforeInliner: Boolean
 )   {
 
   def isAfterInliner = !isBeforeInliner

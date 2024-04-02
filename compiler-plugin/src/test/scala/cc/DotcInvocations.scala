@@ -11,67 +11,65 @@ import reporting.*
 import scala.util.matching.Regex
 
 
-class DotcInvocations(silent: Boolean = false) {
+class DotcInvocations(silent: Boolean = false, scalaJs: Boolean = false) {
 
-  def compileFiles(files: List[String], outDir: String, extraArgs: List[String]=List.empty, checkAll: Boolean = true): Reporter = {
-    val outPath = Path(outDir)
-    if (!outPath.exists) outPath.createDirectory()
+  def compileFiles(files: List[String], outDir: String, extraArgs: List[String]=List.empty, checkAll: Boolean = true, usePlugin: Boolean=true): Reporter = {
     val args = List("-d", outDir) ++
-             List("-Xplugin:src/main/resources", "-usejavacp") ++
+             (if (usePlugin) then List("-Xplugin:src/main/resources") else List.empty) ++
+             compilerClasspathOption ++
              extraArgs ++
              DotcInvocations.defaultCompileOpts ++
-             (if (checkAll) List("-Ycheck:all") else List.empty) ++
-             files
-    val filledReporter = Main.process(args.toArray, reporter, callback)
+             (if (checkAll) List("-Ycheck:all") else List.empty)
+    println(s"compile args: ${args}, usePlugin=${usePlugin}")
+    compileFilesWithFullArgs(files, outDir, args)
+  }
+
+  def compileFilesWithFullArgs(files: List[String], outDir: String, args: List[String]): Reporter = {
+    val outPath = Path(outDir)
+    if (!outPath.exists) outPath.createDirectory()
+    val argsWithFiles = args ++ files
+    val filledReporter = Main.process(argsWithFiles.toArray, reporter, callback)
     filledReporter
   }
 
-  def compileFilesInDirs(dirs: List[String], outDir: String, extraArgs: List[String] = List.empty, checkAll: Boolean = true): Reporter = {
+  def compileFilesInDirsWithFullArgs(dirs: List[String], outDir: String, args: List[String]): Reporter = {
+    println(s"dirs: ${dirs}")
     val files = dirs.flatMap { dir => scalaFilesIn(Path(dir)) }
-    compileFiles(files, outDir, extraArgs, checkAll)
+    println("files: " + files.mkString(" "))
+    compileFilesWithFullArgs(files, outDir, args)
   }
 
-  def compileFilesInDir(dir: String, outDir: String, extraArgs: List[String]=List.empty, checkAll:Boolean = true): Reporter = {
-    compileFilesInDirs(List(dir), outDir, extraArgs, checkAll)
+
+  def compileFilesInDirs(dirs: List[String], outDir: String, extraArgs: List[String] = List.empty, checkAll: Boolean = true, usePlugin: Boolean=true): Reporter = {
+    val files = dirs.flatMap { dir => scalaFilesIn(Path(dir)) }
+    compileFiles(files, outDir, extraArgs, checkAll, usePlugin)
   }
 
-  def compileAndRunFilesInDirs(dirs: List[String], outDir: String, mainClass:String = "Main", extraArgs: List[String] = List.empty): (Int,String) = {
-    val reporter = compileFilesInDirs(dirs, outDir, extraArgs)
+  def compileFilesInDir(dir: String, outDir: String, extraArgs: List[String]=List.empty, checkAll:Boolean = true, usePlugin: Boolean = true): Reporter = {
+    compileFilesInDirs(List(dir), outDir, extraArgs, checkAll, usePlugin)
+  }
+
+
+
+  def compileAndRunFilesInDirsJVM(dirs: List[String], outDir: String, mainClass:String = "Main", extraArgs: List[String] = List.empty, checkAll: Boolean=true, usePlugin: Boolean=true): (Int,String) = {
+    val reporter = compileFilesInDirs(dirs, outDir, extraArgs, checkAll, usePlugin)
     if (reporter.hasErrors) {
       println(s"Compilation failed in dirs ${dirs}")
       DotcInvocations.reportErrors(reporter)
-      throw new RuntimeException("Compilation failed")
+      (reporter.errorCount, reporter.allErrors.map(_.msg).mkString("\n"))
     } else {
-      run(outDir, mainClass)
+      runJVM(outDir, mainClass)
     }
   }
 
-  def compileAndRunFilesInDir(dir: String, outDir: String, mainClass:String = "Main", extraArgs: List[String] = List.empty): (Int,String) = {
-    compileAndRunFilesInDirs(List(dir), outDir, mainClass, extraArgs)
+
+  def compileAndRunFilesInDirJVM(dir: String, outDir: String, mainClass:String = "Main", extraArgs: List[String] = List.empty, checkAll: Boolean=true, usePlugin: Boolean=true): (Int,String) = {
+    compileAndRunFilesInDirsJVM(List(dir), outDir, mainClass, extraArgs, checkAll, usePlugin)
   }
 
-  private def run(outDir: String, mainClass: String, timeout: FiniteDuration = 1.minute): (Int, String) = {
+  private def runJVM(outDir: String, mainClass: String, timeout: FiniteDuration = 1.minute): (Int, String) = {
     val classpath = s"$outDir:${System.getProperty("java.class.path")}"
-    runInClasspath(outDir, mainClass, classpath, timeout)
-  }
-
-  private def runInClasspath(outDir: String, mainClass: String, classpath: String, timeout: FiniteDuration = 1.minute): (Int, String) = {
-    val cmd = s"java -cp $classpath $mainClass"
-    println(s"Running $cmd")
-    val process = Runtime.getRuntime.exec(cmd)
-    blocking {
-      val exitCode = process.waitFor(timeout.toSeconds, java.util.concurrent.TimeUnit.SECONDS)
-      if (exitCode) {
-        val output = scala.io.Source.fromInputStream(process.getInputStream).mkString
-        val errorOutput = scala.io.Source.fromInputStream(process.getErrorStream).mkString
-        println(s"output=${output}")
-        println(s"error=${errorOutput}")
-        (process.exitValue(), output)
-      } else {
-        process.destroy()
-        throw new RuntimeException(s"Process $cmd timed out")
-      }
-    }
+    DotcInvocations.runJVMInClasspath(mainClass, classpath, timeout)
   }
 
 
@@ -107,6 +105,15 @@ class DotcInvocations(silent: Boolean = false) {
     }
 
   }
+
+  private def compilerClasspathOption: List[String] = {
+    if (scalaJs) {
+      List("-classpath", DotcInvocations.currentJsClasspath)
+    } else {
+      List("-usejavacp")
+    }
+  }
+
 }
 
 
@@ -119,6 +126,9 @@ case class DotcInvocationArgs(
                                extraDotcArgs: List[String] = List.empty,
                                silent: Boolean = false,
                                checkAll: Boolean = true,
+                               usePlugin: Boolean = true,
+                               useScalaJsLib: Boolean = false,
+                               outDir: Option[String] = None,
                              )
 
 
@@ -158,7 +168,8 @@ object DotcInvocations {
 
   def compileFilesInDir(dir: String, invocationArgs: DotcInvocationArgs = DotcInvocationArgs()): Reporter = {
     val dotcInvocations = new DotcInvocations(invocationArgs.silent)
-    dotcInvocations.compileFilesInDir(dir, dir, invocationArgs.extraDotcArgs, invocationArgs.checkAll)
+    dotcInvocations.compileFilesInDir(dir, invocationArgs.outDir.getOrElse(dir),
+      invocationArgs.extraDotcArgs, invocationArgs.checkAll, invocationArgs.usePlugin)
     dotcInvocations.reporter
   }
 
@@ -176,7 +187,8 @@ object DotcInvocations {
                                            ): Unit = {
     val dotcInvocations = new DotcInvocations(invocationArgs.silent)
 
-    val (code, output) = dotcInvocations.compileAndRunFilesInDir(dir,dir,mainClass,invocationArgs.extraDotcArgs)
+    val (code, output) = dotcInvocations.compileAndRunFilesInDirJVM(dir,invocationArgs.outDir.getOrElse(dir),
+      mainClass,invocationArgs.extraDotcArgs,invocationArgs.checkAll,invocationArgs.usePlugin)
 
     val reporter = dotcInvocations.reporter
     println("summary: " + reporter.summary)
@@ -222,7 +234,8 @@ object DotcInvocations {
       dependency.compiledFlag.isAlreadyCompiled = true
       println("-----finish common compilation-----")
     }
-    val classpath1 = s"${dependency.outDir}:${System.getProperty("java.class.path")}"
+    val baseClassPath = if (invocationArgs.useScalaJsLib) currentJsClasspath else System.getProperty("java.class.path")
+    val classpath1 = s"${dependency.outDir}:${baseClassPath}"
     val secondInvokationArgs = invocationArgs.copy(extraDotcArgs = List("-classpath", classpath1) ++ invocationArgs.extraDotcArgs)
     DotcInvocations.succesfullyCompileFilesInDir(dirname, secondInvokationArgs)
     val classpath2 = s"${dirname}:${classpath1}"
@@ -252,6 +265,25 @@ object DotcInvocations {
     }
   }
 
+  def runJVMInClasspath(mainClass: String, classpath: String, timeout: FiniteDuration = 1.minute): (Int, String) = {
+    val cmd = s"java -cp $classpath $mainClass"
+    println(s"Running $cmd")
+    val process = Runtime.getRuntime.exec(cmd)
+    blocking {
+      val exitCode = process.waitFor(timeout.toSeconds, java.util.concurrent.TimeUnit.SECONDS)
+      if (exitCode) {
+        val output = scala.io.Source.fromInputStream(process.getInputStream).mkString
+        val errorOutput = scala.io.Source.fromInputStream(process.getErrorStream).mkString
+        println(s"output=${output}")
+        println(s"error=${errorOutput}")
+        (process.exitValue(), output)
+      } else {
+        process.destroy()
+        throw new RuntimeException(s"Process $cmd timed out")
+      }
+    }
+  }
+
 
   def reportErrors(reporter: Reporter): Unit = {
     if (!reporter.allErrors.isEmpty) {
@@ -264,6 +296,13 @@ object DotcInvocations {
   private def checkReporter(reporter: Reporter): Unit = {
     reportErrors(reporter)
     assert(reporter.allErrors.isEmpty, "There should be no errors")
+  }
+
+  private def currentJsClasspath: String = {
+    // substitue the jvm cps classes to js cps classes
+    val classpath = System.getProperty("java.class.path")
+    val jsClasspath = classpath.replaceAll("dotty-cps-async/jvm/target/scala-3.3.3/classes", "dotty-cps-async/js/target/scala-3.3.3/classes")
+    jsClasspath
   }
 
 }

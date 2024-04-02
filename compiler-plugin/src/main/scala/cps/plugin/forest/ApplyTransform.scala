@@ -82,30 +82,33 @@ object ApplyTransform {
              else
                Log.trace(s"cpsAwait not recognized",nesting)
                applyMArgs(term, owner, nesting, Nil)
-        case observatory.ImplicitAwaitCall(arg, tf, ta, tg, gContext, conversion) =>
-              AwaitTransform.fromApply(term, owner, nesting, tf, ta, tg, arg, gContext, conversion)
         case Apply(TypeApply(adoptCpsedCallCn,List(tf,ta)),List(a))
                   if (adoptCpsedCallCn.symbol == Symbols.requiredMethod("cps.plugin.scaffolding.adoptCpsedCall")) =>
-             //  this means that we walk over nesting async.
-             //  leave one unchanged
-             a match
-               case Inlined(call, bindings, expansion) =>
-                  ???
-               case _ =>
-                 Log.trace(s"adoptCpsedCall form at : ${term.show}", nesting)
-                 CpsTree.unchangedPure(term, owner)
+              //  this means that we walk over nesting async.
+              //  leave one unchanged
+              Log.trace(s"adoptCpsedCall form at : ${term.show}", nesting)
+              CpsTree.unchangedPure(term, owner)        
+        case Apply(TypeApply(fun@adoptCpsedCallCn,List(tf,ta)),List(a))
+              if (adoptCpsedCallCn.symbol == Symbols.requiredMethod("cps.plugin.scaffolding.adoptCpsedCallCompileTimeOnly")) =>
+              //  macro generate compile-time only variant of adoptCpsedCall to be stopped if plugin is not present.
+              //  change to adoptCpsedCall
+              Log.trace(s"adoptCpsedCallCompileTimeOnly form at : ${term.show}", nesting)
+              val nFun = ref(Symbols.requiredMethod("cps.plugin.scaffolding.adoptCpsedCall")).withSpan(fun.span)
+              val nTree = Apply(TypeApply(nFun,List(tf,ta)),List(a)).withSpan(term.span)
+              CpsTree.pure(term, owner, nTree)
         case Apply(Apply(TypeApply(fAsynchronizedCm,List(tf,ta)),List(a)),List(fctx))
                          if (fAsynchronizedCm.symbol == Symbols.requiredMethod("cps.asynchronized")) =>
               Log.trace(s"asynchronized at : ${term.show}", nesting)
               AsynchronizedTransform.fromApply(term, owner, nesting, tf, ta, a, fctx)
+              
         case Apply(cnThrow, List(_)) if (cnThrow.symbol == defn.throwMethod) =>
-             ThrowTransform(term, owner, nesting)
+              ThrowTransform(term, owner, nesting)
         case Apply(TypeApply(nonLocalRecturnCn, List(targ)), List(arg))
                          if (nonLocalRecturnCn.symbol == Symbols.requiredMethod("scala.util.control.NonLocalReturns.returning")) =>
-             NonLocalReturnsReturningTransform.apply(term, owner, nesting, targ, arg)
+              NonLocalReturnsReturningTransform.apply(term, owner, nesting, targ, arg)
         case Apply(Apply(TypeApply(throwReturnCn, targs2), List(arg2) ), List(arg1))
                 if (throwReturnCn.symbol == Symbols.requiredMethod("scala.util.control.NonLocalReturns.throwReturn")) =>
-             NonLocalReturnsThrowReturnTransform.apply(term, owner, nesting, throwReturnCn, targs2, arg2, arg1)
+              NonLocalReturnsThrowReturnTransform.apply(term, owner, nesting, throwReturnCn, targs2, arg2, arg1)
         case _ =>
             if (summon[CpsTopLevelContext].isBeforeInliner && atPhase(inliningPhase)(Inlines.needsInlining(term))) {
               val inlined = atPhase(inliningPhase)(Inlines.inlineCall(term))
@@ -588,7 +591,7 @@ object ApplyTransform {
           case Some(args) => Apply(pre1, args)
         val retval = pre2.withSpan(fun.originTree.span)
         if (retval.tpe.isError) {
-          throw CpsTransformException(s"assembleNonOverloaded is error, fun=${fun.show}, generated fun = ${retval.show}", fun.originTree.srcPos)
+           throw CpsTransformException(s"assembleNonOverloaded is error, fun=${fun.show}, generated fun = ${retval.show}", fun.originTree.srcPos)
         }
         retval
       }
@@ -1194,7 +1197,8 @@ object ApplyTransform {
               case ShiftedArgumentsPlainParamsShape.SAME_PARAMS =>
                 None
               case ShiftedArgumentsPlainParamsShape.EXTRA_PARAM_LIST =>
-                Some(List(obj, tctx.cpsMonadRef))
+                // one param with monad, because this is in-place substitution
+                Some(List(tctx.cpsMonadRef))
               case ShiftedArgumentsPlainParamsShape.EXTRA_FIRST_PARAM =>
                 None
             val remainingShapeChange = shape.p match
@@ -1215,6 +1219,26 @@ object ApplyTransform {
         retrieveShiftedMethod(fun.symbol, obj,methodName,targs)
       case Select(obj,methodName) =>
         retrieveShiftedMethod(fun.symbol, obj,methodName,Nil)
+      case TypeApply(fun@Ident(name),targs) =>
+        // this can be method of the enclosing class or method of one of imported projects
+        if (fun.symbol.owner.isClass) then
+            summon[Context].outersIterator.find(_.owner == fun.symbol.owner) match
+              case Some(enclosing) =>
+                retrieveShiftedMethod(fun.symbol, This(enclosing.owner.asClass),name,targs)
+              case None =>
+                // TODO: check for imported methods
+                Left(s"Can't find enclosing class for ${fun.show}")
+        else
+          Left(s"Can't find async-shifted method for ${fun.show}, tree is ${fun}")
+      case fun@Ident(name) =>
+        if (fun.symbol.owner.isClass) then
+          summon[Context].outersIterator.find(_.owner == fun.symbol.owner) match
+            case Some(enclosing) =>
+              retrieveShiftedMethod(fun.symbol, This(enclosing.owner.asClass),name,Nil)
+            case None =>
+              Left(s"Can't find enclosing class for ${fun.show}")
+        else
+          Left(s"Can't find async-shifted method for ${fun.show}, tree is ${fun}")
       case _ =>
         Left(s"Can't find async-shifted method for ${fun.show}, unsupported fun tree ${fun}")
 
@@ -1222,31 +1246,14 @@ object ApplyTransform {
 
   }
 
-  /*
-  def extractFinalResultType(funType:Type, fun:Tree, argss: List[ApplyArgList])(using Context): Type = {
-    argss match
-      case Nil => funType
-      case head :: tail =>
-        if (head.isTypeParams) then
-          extractFinalResultType(funType, fun, tail)
-        else
-          funType match
-            case mt: MethodOrPoly =>
-              extractFinalResultType(mt.resType, fun, tail)
-            case AppliedType(tycon, targs) =>
-              if (defn.isFunctionType(funType)) then
-                extractFinalResultType(targs.last, fun, tail)
-              else if (defn.isContextFunctionType(funType)) then
-                extractFinalResultType(targs.last, fun, tail)
-              //else if (defn.isErasedFunctionType(funType)) then
-              //  extractFinalResultType(targs.last, fun, tail)
-              else
-                throw CpsTransformException(s"Can't extract final result type from ${funType.show}", fun.srcPos)
-            case _ =>
-              throw CpsTransformException(s"Can't extract final result type from ${funType.show}, expect MethodOrPoly or AppliedType", fun.srcPos)
+
+  def findSymbolOwnerInEnclosing(sym: Symbol)(using Context): Option[Symbol] = {
+    if (sym.owner == ctx.owner) then
+        Some(ctx.owner)
+      else
+        ctx.outersIterator.find(_.owner == sym.owner).map(_.owner)
   }
 
-   */
 
   def resolveAsyncShiftedObject(obj: Tree)(using Context): Either[String, Tree] = {
     val asyncShift = ref(requiredClass("cps.AsyncShift")).tpe

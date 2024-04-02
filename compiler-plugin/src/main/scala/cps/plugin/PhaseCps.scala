@@ -13,7 +13,6 @@ import cps.plugin.DefDefSelectKind.{RETURN_CONTEXT_FUN, USING_CONTEXT_PARAM}
 import plugins.*
 import cps.plugin.QuoteLikeAPI.*
 import cps.plugin.forest.*
-import cps.plugin.observatory.AutomaticColoringAnalyzer
 import dotty.tools.dotc.ast.{Trees, tpd}
 import dotty.tools.dotc.core.DenotTransformers.{InfoTransformer, SymTransformer}
 import dotty.tools.dotc.util.SrcPos
@@ -25,12 +24,9 @@ import transform.{ElimPackagePrefixes, Erasure, Inlining, Pickler}
  *  search for async-shift object, it can be inlined.
  * @param settings
  * @param selectedNodes
- * @param shiftedSymbols
  */
 class PhaseCps(settings: CpsPluginSettings,
-               selectedNodes: SelectedNodes,
-               shiftedSymbols:ShiftedSymbols,
-               nextCpsPhaseName: String) extends PluginPhase {
+               selectedNodes: SelectedNodes) extends PluginPhase {
 
   val phaseName = PhaseCps.name
 
@@ -40,8 +36,8 @@ class PhaseCps(settings: CpsPluginSettings,
   override def changesMembers: Boolean = true
 
 
-  override val runsAfter = Set(PhaseSelect.phaseName, Inlining.name, Pickler.name)
-  override val runsBefore = Set(nextCpsPhaseName, ElimPackagePrefixes.name, Erasure.name)
+  override val runsAfter = Set(PhaseSelectAndGenerateShiftedMethods.phaseName, Inlining.name, Pickler.name)
+  override val runsBefore = Set(PhaseChangeSymbolsAndRemoveScaffolding.name, ElimPackagePrefixes.name, Erasure.name)
 
 
   val debug = true
@@ -166,6 +162,11 @@ class PhaseCps(settings: CpsPluginSettings,
              List(absorber, ctxFun)
            ) if (cpsAsyncStreamApplyCn.symbol == Symbols.requiredMethod("cps.plugin.cpsAsyncStreamApply")) =>
         transformCpsAsyncStreamApply(tree,absorber,ctxFun)
+      case app@Apply(tapp@TypeApply(adoptCpsedCallCompileTimeOnlyCn, List(tf, ta)), List(a))
+        if (adoptCpsedCallCompileTimeOnlyCn.symbol == Symbols.requiredMethod("cps.plugin.scaffolding.adoptCpsedCallCompileTimeOnly")) =>
+           val adoptCpsedCall = ref(Symbols.requiredMethod("cps.plugin.scaffolding.adoptCpsedCall")).withSpan(adoptCpsedCallCompileTimeOnlyCn.span)
+           val nApp = Apply(TypeApply(adoptCpsedCall, List(tf, ta)), List(a)).withSpan(app.span)
+           transformApplyInternal(nApp)
       case Apply(TypeApply(adoptCpsedCallCn, List(tf, ta)), List(a))
         if (adoptCpsedCallCn.symbol == Symbols.requiredMethod("cps.plugin.scaffolding.adoptCpsedCall")) =>
           a match
@@ -197,6 +198,14 @@ class PhaseCps(settings: CpsPluginSettings,
                   super.transformApply(tree)
             case _ =>
               super.transformApply(tree)
+      case Apply(Apply(TypeApply(deferredAsyncCn, List(tp,mtp,mctp)), List(applyTerm)), List(ctx))
+        if (deferredAsyncCn.symbol == Symbols.requiredMethod("cps.plugin.scaffolding.deferredAsync")) =>
+            val (tc, monadValDef) = makeCpsTopLevelContext(ctx,summon[Context].owner, tree.srcPos, DebugSettings.make(tree), CpsTransformHelper.cpsMonadContextClassSymbol)
+            val nApplyTerm = {
+              given CpsTopLevelContext = tc
+              RootTransform(applyTerm, summon[Context].owner, 0).transformed
+            }
+            Block(monadValDef::Nil, nApplyTerm).withSpan(applyTerm.span)
       case _ => super.transformApply(tree)
 
  
@@ -221,7 +230,6 @@ class PhaseCps(settings: CpsPluginSettings,
       case _ => throw CpsTransformException(s"excepted that cpsMonadContext is ValDef, but we have ${cpsMonadContext.show}", asyncCallTree.srcPos)
     val (tctx, monadValDef) = makeCpsTopLevelContext(contextParam, ddef.symbol, asyncCallTree.srcPos, DebugSettings.make(asyncCallTree), CpsTransformHelper.cpsMonadContextClassSymbol)
     val ddefCtx = ctx.withOwner(ddef.symbol)
-    tctx.automaticColoring.foreach(_.analyzer.observe(ddef.rhs)(using ddefCtx))
     val nRhsCps = RootTransform(ddef.rhs, ddef.symbol, 0)(using ddefCtx, tctx)
     val nRhsTerm = wrapTopLevelCpsTree(nRhsCps)(using ddefCtx, tctx)
     val nRhsType = nRhsTerm.tpe.widen
@@ -389,23 +397,11 @@ class PhaseCps(settings: CpsPluginSettings,
     val isBeforeInliner = if (runsBefore.contains(Inlining.name)) { true }
                           else if (runsAfter.contains(Inlining.name)) { false }
                           else
-                             throw new CpsTransformException("plugins runsBefore/After Inlining not found", srcPos)
-    val automaticColoringTag = CpsTransformHelper.findAutomaticColoringTag(monadType, srcPos.span)
-    val automaticColoring = if (automaticColoringTag.isDefined) {
-      val memoization = CpsTransformHelper.findCpsMonadMemoization(monadType, srcPos.span)
-      if (memoization.isDefined) {
-        val analyzer = new AutomaticColoringAnalyzer()
-        Some(CpsAutomaticColoring(memoization.get,analyzer))
-      } else {
-        throw CpsTransformException(s"Can't find instance of cps.CpsMemoization for ${monadType.show}", srcPos)
-      }
-    } else None
-    val customValueDiscard = automaticColoring.isDefined || CpsTransformHelper.findCustomValueDiscardTag(srcPos.span).isDefined
+                             throw CpsTransformException("plugins runsBefore/After Inlining not found", srcPos)
     val tc = CpsTopLevelContext(monadType, monadRef, cpsDirectOrSimpleContext,
                                 optRuntimeAwait, optRuntimeAwaitProvider,
                                 optThrowSupport, optTrySupport,
-                                debugSettings, settings, isBeforeInliner,
-                                automaticColoring, customValueDiscard)
+                                debugSettings, settings, isBeforeInliner)
     (tc, monadValDef)
   }
 
